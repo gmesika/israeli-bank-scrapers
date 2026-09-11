@@ -88,15 +88,17 @@ export class BaseScraper<TCredentials extends ScraperCredentials> implements Scr
     this.emitProgress(ScraperProgressTypes.Terminating);
   }
 
-  protected emitProgress(type: ScraperProgressTypes) {
-    this.emit(SCRAPE_PROGRESS, { type });
+  protected emitProgress(type: ScraperProgressTypes | string, detail?: string) {
+    this.emit(SCRAPE_PROGRESS, { type, ...(detail ? { detail } : {}) });
   }
 
   protected emit(eventName: string, payload: Record<string, any>) {
     this.eventEmitter.emit(eventName, this.options.companyId, payload);
   }
 
-  onProgress(func: (companyId: CompanyTypes, payload: { type: ScraperProgressTypes }) => void) {
+  onProgress(
+    func: (companyId: CompanyTypes, payload: { type: ScraperProgressTypes | string; detail?: string }) => void,
+  ) {
     this.eventEmitter.on(SCRAPE_PROGRESS, func);
   }
 }

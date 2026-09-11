@@ -103,6 +103,97 @@ const checkingAccountTabHebrewName = 'עובר ושב';
 const checkingAccountTabEnglishName = 'Checking Account';
 const genericDescriptions = ['העברת יומן לבנק זר מסניף זר'];
 
+function sanitizeUrlForLog(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url.split('?')[0] ?? url;
+  }
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const aggregate = err as Error & { errors?: unknown[] };
+    if (Array.isArray(aggregate.errors) && aggregate.errors.length > 0) {
+      return `${err.name}: ${err.message} [${aggregate.errors.map(describeError).join(' | ')}]`;
+    }
+    return `${err.name}: ${err.message}`;
+  }
+  return String(err);
+}
+
+function isMizrahiApiUrl(url: string): boolean {
+  return /SkyOSH|get428|Online\/api|OnlinePilot\/api|getMaherBerurim|osh\/legacy|p428|p420/i.test(url);
+}
+
+function matchLookedForUrl(url: string, candidates: string[]): 'exact' | 'prefix' | null {
+  const pathOnly = url.split('?')[0];
+  if (candidates.includes(url) || candidates.includes(pathOnly)) {
+    return 'exact';
+  }
+  if (candidates.some(candidate => pathOnly.startsWith(candidate) || url.startsWith(candidate))) {
+    return 'prefix';
+  }
+  return null;
+}
+
+async function collectHrefsContaining(page: Page, needle: string): Promise<string[]> {
+  return page.$$eval(
+    'a[href]',
+    (anchors, part: string) =>
+      anchors.map(anchor => anchor.getAttribute('href') || '').filter(href => href.includes(part)),
+    needle,
+  );
+}
+
+async function collectOshLikeHrefs(page: Page): Promise<string[]> {
+  return page.$$eval('a[href]', anchors =>
+    anchors.map(anchor => anchor.getAttribute('href') || '').filter(href => /osh|428|420|SkyOSH/i.test(href)),
+  );
+}
+
+function startRequestSniffer(page: Page, lookedForUrls: string[]) {
+  const seen: string[] = [];
+  const handler = (request: HTTPRequest) => {
+    const url = request.url();
+    if (!isMizrahiApiUrl(url)) {
+      return;
+    }
+    const sanitized = sanitizeUrlForLog(url);
+    const match = matchLookedForUrl(url, lookedForUrls);
+    const line = `${request.method()} ${sanitized}${match ? ` [${match}-match]` : ''}`;
+    seen.push(line);
+    debug('network %s', line);
+  };
+  page.on('request', handler);
+  return {
+    seen,
+    stop() {
+      page.off('request', handler);
+    },
+  };
+}
+
+async function clickHrefContaining(page: Page, hrefPart: string, purpose: string): Promise<string[]> {
+  const selector = `a[href*="${hrefPart}"]`;
+  debug('looking for %s selector=%s url=%s', purpose, selector, sanitizeUrlForLog(page.url()));
+  try {
+    await waitUntilElementFound(page, selector);
+  } catch (err) {
+    const similar = await collectOshLikeHrefs(page).catch(() => []);
+    debug('NOT FOUND %s selector=%s similarHrefs=%o error=%s', purpose, selector, similar, describeError(err));
+    throw new Error(
+      `Mizrahi: looking for ${purpose} (${selector}) — not found. similar hrefs: ${similar.join(', ') || 'none'}. ${describeError(err)}`,
+    );
+  }
+  const hrefs = await collectHrefsContaining(page, hrefPart);
+  debug('found %s count=%d hrefs=%o', purpose, hrefs.length, hrefs);
+  await page.$eval(selector, el => (el as HTMLElement).click());
+  debug('clicked %s url=%s', purpose, sanitizeUrlForLog(page.url()));
+  return hrefs;
+}
+
 function createLoginFields(credentials: ScraperSpecificCredentials) {
   return [
     { selector: usernameSelector, value: credentials.username },
@@ -296,10 +387,23 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     };
   }
 
+  private logStep(phase: string, detail: string) {
+    debug('%s %s url=%s', phase, detail, sanitizeUrlForLog(this.page.url()));
+    this.emitProgress(phase, detail);
+  }
+
   async fetchData() {
-    await this.page.$eval('#dropdownBasic, .item', el => (el as HTMLElement).click());
+    this.logStep('MIZRAHI_ACCOUNTS', `looking for account dropdown ${accountDropDownItemSelector}`);
+    try {
+      await this.page.$eval('#dropdownBasic, .item', el => (el as HTMLElement).click());
+    } catch (err) {
+      throw new Error(
+        `Mizrahi: looking for account dropdown (#dropdownBasic, .item) — not found. ${describeError(err)}`,
+      );
+    }
 
     const numOfAccounts = (await this.page.$$(accountDropDownItemSelector)).length;
+    this.logStep('MIZRAHI_ACCOUNTS', `found ${numOfAccounts} account(s)`);
 
     try {
       const results: TransactionsAccount[] = [];
@@ -309,94 +413,171 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
           await this.page.$eval('#dropdownBasic, .item', el => (el as HTMLElement).click());
         }
 
+        this.logStep('MIZRAHI_ACCOUNTS', `select account ${i + 1}/${numOfAccounts}`);
         await this.page.$eval(`${accountDropDownItemSelector}:nth-child(${i + 1})`, el => (el as HTMLElement).click());
         results.push(await this.fetchAccount());
       }
+
+      this.logStep(
+        'MIZRAHI_DONE',
+        `scraped ${results.length} account(s), txns=${results.reduce((sum, account) => sum + account.txns.length, 0)}`,
+      );
 
       return {
         success: true,
         accounts: results,
       };
     } catch (e) {
+      const errorMessage = describeError(e);
+      debug('fetchData failed: %s', errorMessage);
+      this.logStep('MIZRAHI_FAIL', errorMessage.slice(0, 400));
       return {
         success: false,
         errorType: ScraperErrorTypes.Generic,
-        errorMessage: (e as Error).message,
+        errorMessage: e instanceof Error ? e.message : errorMessage,
       };
     }
   }
 
   private async getPendingTransactions(): Promise<Transaction[]> {
-    await this.page.$eval(`a[href*="${PENDING_TRANSACTIONS_PAGE}"]`, el => (el as HTMLElement).click());
+    this.logStep('MIZRAHI_PENDING', `looking for pending page ${PENDING_TRANSACTIONS_PAGE}`);
+    await clickHrefContaining(this.page, PENDING_TRANSACTIONS_PAGE, 'pending-transactions page');
+    this.logStep('MIZRAHI_PENDING', `looking for iframe containing ${PENDING_TRANSACTIONS_IFRAME}`);
     const frame = await waitUntilIframeFound(this.page, f => f.url().includes(PENDING_TRANSACTIONS_IFRAME));
+    debug('found pending iframe url=%s', sanitizeUrlForLog(frame.url()));
     const isPending = await waitUntilElementFound(frame, pendingTrxIdentifierId)
       .then(() => true)
-      .catch(() => false);
+      .catch(err => {
+        debug('pending table %s not found: %s', pendingTrxIdentifierId, describeError(err));
+        return false;
+      });
     if (!isPending) {
+      this.logStep('MIZRAHI_PENDING', `pending table ${pendingTrxIdentifierId} not found — 0 pending`);
       return [];
     }
 
     const pendingTxn = await extractPendingTransactions(frame);
+    this.logStep('MIZRAHI_PENDING', `found ${pendingTxn.length} pending txn(s)`);
     return pendingTxn;
   }
 
   private async fetchAccount() {
-    await this.page.waitForSelector(`a[href*="${OSH_PAGE}"]`);
-    await this.page.$eval(`a[href*="${OSH_PAGE}"]`, el => (el as HTMLElement).click());
-    await waitUntilElementFound(this.page, `a[href*="${TRANSACTIONS_PAGE}"]`);
-    await this.page.$eval(`a[href*="${TRANSACTIONS_PAGE}"]`, el => (el as HTMLElement).click());
+    this.logStep('MIZRAHI_OSH', `looking for checking-account tab ${OSH_PAGE}`);
+    await clickHrefContaining(this.page, OSH_PAGE, 'checking-account tab');
 
-    const accountNumberElement = await this.page.$('#dropdownBasic b span');
-    const accountNumberHandle = await accountNumberElement?.getProperty('title');
-    const accountNumber = (await accountNumberHandle?.jsonValue()) as string;
-    if (!accountNumber) {
-      throw new Error('Account number not found');
-    }
+    this.logStep('MIZRAHI_TX_PAGE', `looking for transactions page ${TRANSACTIONS_PAGE}`);
+    const txHrefs = await collectHrefsContaining(this.page, TRANSACTIONS_PAGE).catch(() => []);
+    debug('transactions-page hrefs before click=%o', txHrefs);
 
-    const [response, apiHeaders] = await Promise.any(
-      TRANSACTIONS_REQUEST_URLS.map(async url => {
-        const request = await this.page.waitForRequest(url);
-        const data = createDataFromRequest(request, this.options.startDate);
-        const headers = createHeadersFromRequest(request);
-
-        return [await fetchPostWithinPage<ScrapedTransactionsResult>(this.page, url, data, headers), headers] as const;
-      }),
+    const lookedFor = TRANSACTIONS_REQUEST_URLS.map(sanitizeUrlForLog);
+    this.logStep(
+      'MIZRAHI_WAIT_API',
+      `looking for TX API ${lookedFor.map(url => url.replace(BASE_APP_URL, '')).join(' | ')}`,
     );
+    const sniffer = startRequestSniffer(this.page, TRANSACTIONS_REQUEST_URLS);
 
-    if (!response || response.header.success === false) {
-      throw new Error(
-        `Error fetching transaction. Response message: ${response ? response.header.messages[0].text : ''}`,
-      );
-    }
+    try {
+      await clickHrefContaining(this.page, TRANSACTIONS_PAGE, 'transactions page');
 
-    const relevantRows = response.body.table.rows.filter(row => row.RecTypeSpecified);
-    const oshTxn = await convertTransactions(
-      relevantRows,
-      this.options.additionalTransactionInformation
-        ? row => getExtraTransactionDetails(this.page, row, apiHeaders)
-        : () => Promise.resolve({ entries: {}, memo: undefined }),
-      this.options.optInFeatures?.includes('mizrahi:pendingIfTodayTransaction'),
-      this.options,
-    );
+      this.logStep('MIZRAHI_ACCOUNT', 'looking for account number #dropdownBasic b span');
+      const accountNumberElement = await this.page.$('#dropdownBasic b span');
+      const accountNumberHandle = await accountNumberElement?.getProperty('title');
+      const accountNumber = (await accountNumberHandle?.jsonValue()) as string;
+      if (!accountNumber) {
+        throw new Error(
+          `Mizrahi: looking for account number (#dropdownBasic b span) — not found. url=${sanitizeUrlForLog(this.page.url())}`,
+        );
+      }
+      this.logStep('MIZRAHI_ACCOUNT', `found account ${accountNumber}`);
 
-    oshTxn
-      .filter(txn => this.shouldMarkAsPending(txn))
-      .forEach(txn => {
-        txn.status = TransactionStatuses.Pending;
+      const [response, apiHeaders] = await Promise.any(
+        TRANSACTIONS_REQUEST_URLS.map(async url => {
+          debug('waiting for request %s', sanitizeUrlForLog(url));
+          try {
+            const request = await this.page.waitForRequest(url);
+            debug('caught request %s %s', request.method(), sanitizeUrlForLog(request.url()));
+            const data = createDataFromRequest(request, this.options.startDate);
+            const headers = createHeadersFromRequest(request);
+            debug(
+              'replay POST %s from=%s to=%s xsrf=%s',
+              sanitizeUrlForLog(url),
+              data.inFromDate,
+              data.inToDate,
+              Boolean(headers.mizrahixsrftoken),
+            );
+            const result = await fetchPostWithinPage<ScrapedTransactionsResult>(this.page, url, data, headers);
+            debug(
+              'API response url=%s success=%s rows=%s yitra=%s',
+              sanitizeUrlForLog(url),
+              result?.header?.success,
+              result?.body?.table?.rows?.length ?? 'n/a',
+              result?.body?.fields?.Yitra ?? 'n/a',
+            );
+            return [result, headers] as const;
+          } catch (err) {
+            debug('candidate failed %s %s', sanitizeUrlForLog(url), describeError(err));
+            throw err;
+          }
+        }),
+      ).catch(err => {
+        const frames = this.page.frames().map(frame => sanitizeUrlForLog(frame.url()));
+        const seen = sniffer.seen.length ? sniffer.seen.join(', ') : 'none';
+        const message = `Mizrahi TX API: all candidates failed. looked for: ${lookedFor.join(', ')}. seen requests: ${seen}. page=${sanitizeUrlForLog(this.page.url())}. frames=${frames.join(' | ') || 'none'}. ${describeError(err)}`;
+        debug(message);
+        throw new Error(message);
       });
 
-    // workaround for a bug which the bank's API returns transactions before the requested start date
-    const startMoment = getStartMoment(this.options.startDate);
-    const oshTxnAfterStartDate = oshTxn.filter(txn => moment(txn.date).isSameOrAfter(startMoment));
+      if (!response || response.header.success === false) {
+        throw new Error(
+          `Error fetching transaction. Response message: ${response ? response.header.messages[0].text : ''}`,
+        );
+      }
 
-    const pendingTxn = await this.getPendingTransactions();
-    const allTxn = oshTxnAfterStartDate.concat(pendingTxn);
+      const relevantRows = response.body.table.rows.filter(row => row.RecTypeSpecified);
+      this.logStep(
+        'MIZRAHI_API',
+        `found ${response.body.table.rows.length} row(s), relevant=${relevantRows.length}, yitra=${response.body.fields?.Yitra ?? 'n/a'}`,
+      );
+      const oshTxn = await convertTransactions(
+        relevantRows,
+        this.options.additionalTransactionInformation
+          ? row => getExtraTransactionDetails(this.page, row, apiHeaders)
+          : () => Promise.resolve({ entries: {}, memo: undefined }),
+        this.options.optInFeatures?.includes('mizrahi:pendingIfTodayTransaction'),
+        this.options,
+      );
 
-    return {
-      accountNumber,
-      txns: allTxn,
-      balance: +response.body.fields?.Yitra,
-    };
+      oshTxn
+        .filter(txn => this.shouldMarkAsPending(txn))
+        .forEach(txn => {
+          txn.status = TransactionStatuses.Pending;
+        });
+
+      // workaround for a bug which the bank's API returns transactions before the requested start date
+      const startMoment = getStartMoment(this.options.startDate);
+      const oshTxnAfterStartDate = oshTxn.filter(txn => moment(txn.date).isSameOrAfter(startMoment));
+      debug(
+        'date filter start=%s kept=%d dropped=%d',
+        startMoment.format(DATE_FORMAT),
+        oshTxnAfterStartDate.length,
+        oshTxn.length - oshTxnAfterStartDate.length,
+      );
+
+      const pendingTxn = await this.getPendingTransactions();
+      const allTxn = oshTxnAfterStartDate.concat(pendingTxn);
+      this.logStep(
+        'MIZRAHI_ACCOUNT',
+        `account ${accountNumber} completed txns=${oshTxnAfterStartDate.length} pending=${pendingTxn.length}`,
+      );
+
+      return {
+        accountNumber,
+        txns: allTxn,
+        balance: +response.body.fields?.Yitra,
+      };
+    } finally {
+      sniffer.stop();
+    }
   }
 
   private shouldMarkAsPending(txn: Transaction): boolean {

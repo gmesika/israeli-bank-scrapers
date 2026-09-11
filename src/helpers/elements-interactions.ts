@@ -59,6 +59,9 @@ async function waitUntilIframeFound(
 }
 
 async function fillInput(pageOrFrame: Page | Frame, inputSelector: string, inputValue: string): Promise<void> {
+  if (typeof inputValue !== 'string') {
+    throw new Error(`fillInput: expected string value for selector "${inputSelector}"`);
+  }
   await waitUntilElementInteractive(pageOrFrame, inputSelector);
   await pageOrFrame.$eval(inputSelector, (input: Element) => {
     const inputElement = input;

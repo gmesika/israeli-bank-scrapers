@@ -1,6 +1,9 @@
 import { type Page } from 'puppeteer';
+import { randomDelay, sleep } from './waiting';
 
 const JSON_CONTENT_TYPE = 'application/json';
+const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
+const DEFAULT_FETCH_RETRIES = 3;
 
 function getJsonHeaders() {
   return {
@@ -9,12 +12,21 @@ function getJsonHeaders() {
   };
 }
 
+function isRetryableStatus(status: number): boolean {
+  return RETRYABLE_STATUS_CODES.has(status);
+}
+
 function assertAutomationNotBlocked(status: number, responseText: string | null, url: string) {
   if (status === 429 || (responseText && /block automation|bot detection/i.test(responseText))) {
     throw new Error(
       `Automation detected and blocked by server. Status: ${status}, URL: ${url}. The site is actively blocking automated access. Consider: 1) Using showBrowser:true, 2) Adding longer delays, 3) Using residential proxies, 4) Running at different times of day`,
     );
   }
+}
+
+async function retryDelay(attempt: number): Promise<void> {
+  await sleep(2 ** attempt * 1000);
+  await randomDelay(200, 800);
 }
 
 export async function fetchGet<TResult>(url: string, extraHeaders: Record<string, any>): Promise<TResult> {
@@ -66,37 +78,47 @@ export async function fetchGetWithinPage<TResult>(
   page: Page,
   url: string,
   ignoreErrors = false,
+  maxRetries = DEFAULT_FETCH_RETRIES,
 ): Promise<TResult | null> {
-  const [result, status] = await page.evaluate(async innerUrl => {
-    let response: Response | undefined;
-    try {
-      response = await fetch(innerUrl, { credentials: 'include' });
-      if (response.status === 204) {
-        return [null, response.status] as const;
-      }
-      return [await response.text(), response.status] as const;
-    } catch (e) {
-      throw new Error(
-        `fetchGetWithinPage error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${innerUrl}, status: ${response?.status}`,
-      );
-    }
-  }, url);
-
-  if (!ignoreErrors) {
-    assertAutomationNotBlocked(status, result, url);
-  }
-
-  if (result !== null) {
-    try {
-      return JSON.parse(result);
-    } catch (e) {
-      if (!ignoreErrors) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const [result, status] = await page.evaluate(async innerUrl => {
+      let response: Response | undefined;
+      try {
+        response = await fetch(innerUrl, { credentials: 'include' });
+        if (response.status === 204) {
+          return [null, response.status] as const;
+        }
+        return [await response.text(), response.status] as const;
+      } catch (e) {
         throw new Error(
-          `fetchGetWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, result: ${result}, status: ${status}`,
+          `fetchGetWithinPage error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${innerUrl}, status: ${response?.status}`,
         );
       }
+    }, url);
+
+    if (!ignoreErrors && isRetryableStatus(status) && attempt < maxRetries) {
+      await retryDelay(attempt);
+      continue;
     }
+
+    if (!ignoreErrors) {
+      assertAutomationNotBlocked(status, result, url);
+    }
+
+    if (result !== null) {
+      try {
+        return JSON.parse(result);
+      } catch (e) {
+        if (!ignoreErrors) {
+          throw new Error(
+            `fetchGetWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, result: ${result}, status: ${status}`,
+          );
+        }
+      }
+    }
+    return null;
   }
+
   return null;
 }
 
@@ -106,43 +128,53 @@ export async function fetchPostWithinPage<TResult>(
   data: Record<string, any>,
   extraHeaders: Record<string, any> = {},
   ignoreErrors = false,
+  maxRetries = DEFAULT_FETCH_RETRIES,
 ): Promise<TResult | null> {
-  const [resultText, status] = await page.evaluate(
-    async (innerUrl: string, innerData: Record<string, any>, innerExtraHeaders: Record<string, any>) => {
-      const response = await fetch(innerUrl, {
-        method: 'POST',
-        body: JSON.stringify(innerData),
-        credentials: 'include',
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const [resultText, status] = await page.evaluate(
+      async (innerUrl: string, innerData: Record<string, any>, innerExtraHeaders: Record<string, any>) => {
+        const response = await fetch(innerUrl, {
+          method: 'POST',
+          body: JSON.stringify(innerData),
+          credentials: 'include',
 
-        headers: Object.assign(
-          { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-          innerExtraHeaders,
-        ),
-      });
-      if (response.status === 204) {
-        return [null, response.status] as const;
-      }
-      return [await response.text(), response.status] as const;
-    },
-    url,
-    data,
-    extraHeaders,
-  );
+          headers: Object.assign(
+            { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+            innerExtraHeaders,
+          ),
+        });
+        if (response.status === 204) {
+          return [null, response.status] as const;
+        }
+        return [await response.text(), response.status] as const;
+      },
+      url,
+      data,
+      extraHeaders,
+    );
 
-  if (!ignoreErrors) {
-    assertAutomationNotBlocked(status, resultText, url);
-  }
-
-  try {
-    if (resultText !== null) {
-      return JSON.parse(resultText);
+    if (!ignoreErrors && isRetryableStatus(status) && attempt < maxRetries) {
+      await retryDelay(attempt);
+      continue;
     }
-  } catch (e) {
+
     if (!ignoreErrors) {
-      throw new Error(
-        `fetchPostWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, data: ${JSON.stringify(data)}, extraHeaders: ${JSON.stringify(extraHeaders)}, result: ${resultText}`,
-      );
+      assertAutomationNotBlocked(status, resultText, url);
     }
+
+    try {
+      if (resultText !== null) {
+        return JSON.parse(resultText);
+      }
+    } catch (e) {
+      if (!ignoreErrors) {
+        throw new Error(
+          `fetchPostWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, data: ${JSON.stringify(data)}, extraHeaders: ${JSON.stringify(extraHeaders)}, result: ${resultText}`,
+        );
+      }
+    }
+    return null;
   }
+
   return null;
 }

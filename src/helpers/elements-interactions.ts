@@ -10,6 +10,26 @@ async function waitUntilElementFound(
   await page.waitForSelector(elementSelector, { visible: onlyVisible, timeout });
 }
 
+async function waitUntilElementInteractive(pageOrFrame: Page | Frame, elementSelector: string, timeout?: number) {
+  await waitUntilElementFound(pageOrFrame, elementSelector, true, timeout);
+  await pageOrFrame.waitForFunction(
+    selector => {
+      const element = document.querySelector(selector);
+      if (!element) {
+        return false;
+      }
+      const htmlElement = element as HTMLElement;
+      if ((htmlElement as HTMLInputElement | HTMLButtonElement).disabled) {
+        return false;
+      }
+      const rect = htmlElement.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    },
+    { timeout },
+    elementSelector,
+  );
+}
+
 async function waitUntilElementDisappear(page: Page, elementSelector: string, timeout?: number) {
   await page.waitForSelector(elementSelector, { hidden: true, timeout });
 }
@@ -39,15 +59,17 @@ async function waitUntilIframeFound(
 }
 
 async function fillInput(pageOrFrame: Page | Frame, inputSelector: string, inputValue: string): Promise<void> {
+  await waitUntilElementInteractive(pageOrFrame, inputSelector);
   await pageOrFrame.$eval(inputSelector, (input: Element) => {
     const inputElement = input;
     // @ts-ignore
     inputElement.value = '';
   });
-  await pageOrFrame.type(inputSelector, inputValue);
+  await pageOrFrame.type(inputSelector, inputValue, { delay: 20 });
 }
 
 async function setValue(pageOrFrame: Page | Frame, inputSelector: string, inputValue: string): Promise<void> {
+  await waitUntilElementInteractive(pageOrFrame, inputSelector);
   await pageOrFrame.$eval(
     inputSelector,
     (input: Element, value) => {
@@ -59,16 +81,22 @@ async function setValue(pageOrFrame: Page | Frame, inputSelector: string, inputV
   );
 }
 
-async function clickButton(page: Page | Frame, buttonSelector: string) {
-  await page.$eval(buttonSelector, el => (el as HTMLElement).click());
+async function clickButton(pageOrFrame: Page | Frame, buttonSelector: string) {
+  await waitUntilElementInteractive(pageOrFrame, buttonSelector);
+  await pageOrFrame.$eval(buttonSelector, el => {
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    (el as HTMLElement).click();
+  });
 }
 
 async function clickLink(page: Page, aSelector: string) {
+  await waitUntilElementInteractive(page, aSelector);
   await page.$eval(aSelector, (el: any) => {
     if (!el || typeof el.click === 'undefined') {
       return;
     }
 
+    el.scrollIntoView({ block: 'center', inline: 'center' });
     el.click();
   });
 }
@@ -85,7 +113,6 @@ async function pageEvalAll<R>(
     await page.waitForFunction(() => document.readyState === 'complete');
     result = await page.$$eval(selector, callback, ...args);
   } catch (e) {
-    // TODO temporary workaround to puppeteer@1.5.0 which breaks $$eval bevahvior until they will release a new version.
     if (!(e as Error).message.startsWith('Error: failed to find elements matching selector')) {
       throw e;
     }
@@ -106,7 +133,6 @@ async function pageEval<R>(
     await pageOrFrame.waitForFunction(() => document.readyState === 'complete');
     result = await pageOrFrame.$eval(selector, callback, ...args);
   } catch (e) {
-    // TODO temporary workaround to puppeteer@1.5.0 which breaks $$eval bevahvior until they will release a new version.
     if (!(e as Error).message.startsWith('Error: failed to find element matching selector')) {
       throw e;
     }
@@ -120,6 +146,7 @@ async function elementPresentOnPage(pageOrFrame: Page | Frame, selector: string)
 }
 
 async function dropdownSelect(page: Page, selectSelector: string, value: string) {
+  await waitUntilElementInteractive(page, selectSelector);
   await page.select(selectSelector, value);
 }
 
@@ -149,5 +176,6 @@ export {
   setValue,
   waitUntilElementDisappear,
   waitUntilElementFound,
+  waitUntilElementInteractive,
   waitUntilIframeFound,
 };

@@ -1,8 +1,10 @@
 import puppeteer, { type Frame, type Page, type PuppeteerLifeCycleEvent } from 'puppeteer';
 import { ScraperProgressTypes } from '../definitions';
+import { defaultBrowserArgs, preparePageForScraping } from '../helpers/browser';
 import { getDebug } from '../helpers/debug';
 import { clickButton, fillInput, waitUntilElementFound } from '../helpers/elements-interactions';
 import { getCurrentUrl, waitForNavigation } from '../helpers/navigation';
+import { sleep } from '../helpers/waiting';
 import { BaseScraper } from './base-scraper';
 import { ScraperErrorTypes } from './errors';
 import { type ScraperCredentials, type ScraperScrapingResult } from './interface';
@@ -113,6 +115,8 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
 
     this.page = page;
 
+    await preparePageForScraping(page);
+
     this.cleanups.push(() => page.close());
 
     if (this.options.defaultTimeout) {
@@ -169,7 +173,7 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
       env: this.options.verbose ? { DEBUG: '*', ...process.env } : undefined,
       headless,
       executablePath,
-      args,
+      args: [...defaultBrowserArgs, ...(args ?? [])],
       timeout,
     });
 
@@ -207,6 +211,8 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
       const status = response.status();
       if (retries > 0) {
         debug(`Failed to navigate to url ${url}, status code: ${status}, retrying ${retries} more times`);
+        const maxRetries = this.options.navigationRetryCount ?? 0;
+        await sleep(1000 * (maxRetries - retries + 1));
         await this.navigateTo(url, waitUntil, retries - 1);
       } else {
         throw new Error(`Failed to navigate to url ${url}, status code: ${status}`);

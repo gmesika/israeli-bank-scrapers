@@ -155,6 +155,7 @@ async function collectOshLikeHrefs(page: Page): Promise<string[]> {
 
 function startRequestSniffer(page: Page, lookedForUrls: string[]) {
   const seen: string[] = [];
+  const matchedRequests: HTTPRequest[] = [];
   const handler = (request: HTTPRequest) => {
     const url = request.url();
     if (!isMizrahiApiUrl(url)) {
@@ -164,11 +165,15 @@ function startRequestSniffer(page: Page, lookedForUrls: string[]) {
     const match = matchLookedForUrl(url, lookedForUrls);
     const line = `${request.method()} ${sanitized}${match ? ` [${match}-match]` : ''}`;
     seen.push(line);
+    if (match === 'exact') {
+      matchedRequests.push(request);
+    }
     debug('network %s', line);
   };
   page.on('request', handler);
   return {
     seen,
+    matchedRequests,
     stop() {
       page.off('request', handler);
     },
@@ -477,6 +482,19 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     const sniffer = startRequestSniffer(this.page, TRANSACTIONS_REQUEST_URLS);
 
     try {
+      // get428Index fires on the click; arm waiters first so we do not miss it
+      // while reading the account number.
+      const requestWaiters = TRANSACTIONS_REQUEST_URLS.map(url => {
+        debug('waiting for request %s', sanitizeUrlForLog(url));
+        return this.page.waitForRequest(url).then(request => {
+          debug('caught request %s %s', request.method(), sanitizeUrlForLog(request.url()));
+          return { url, request };
+        });
+      });
+      requestWaiters.forEach(waiter => {
+        void waiter.catch(() => undefined);
+      });
+
       await clickHrefContaining(this.page, TRANSACTIONS_PAGE, 'transactions page');
 
       this.logStep('MIZRAHI_ACCOUNT', 'looking for account number #dropdownBasic b span');
@@ -490,42 +508,43 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       }
       this.logStep('MIZRAHI_ACCOUNT', `found account ${accountNumber}`);
 
-      const [response, apiHeaders] = await Promise.any(
-        TRANSACTIONS_REQUEST_URLS.map(async url => {
-          debug('waiting for request %s', sanitizeUrlForLog(url));
-          try {
-            const request = await this.page.waitForRequest(url);
-            debug('caught request %s %s', request.method(), sanitizeUrlForLog(request.url()));
-            const data = createDataFromRequest(request, this.options.startDate);
-            const headers = createHeadersFromRequest(request);
-            debug(
-              'replay POST %s from=%s to=%s xsrf=%s',
-              sanitizeUrlForLog(url),
-              data.inFromDate,
-              data.inToDate,
-              Boolean(headers.mizrahixsrftoken),
-            );
-            const result = await fetchPostWithinPage<ScrapedTransactionsResult>(this.page, url, data, headers);
-            debug(
-              'API response url=%s success=%s rows=%s yitra=%s',
-              sanitizeUrlForLog(url),
-              result?.header?.success,
-              result?.body?.table?.rows?.length ?? 'n/a',
-              result?.body?.fields?.Yitra ?? 'n/a',
-            );
-            return [result, headers] as const;
-          } catch (err) {
-            debug('candidate failed %s %s', sanitizeUrlForLog(url), describeError(err));
-            throw err;
-          }
-        }),
-      ).catch(err => {
-        const frames = this.page.frames().map(frame => sanitizeUrlForLog(frame.url()));
-        const seen = sniffer.seen.length ? sniffer.seen.join(', ') : 'none';
-        const message = `Mizrahi TX API: all candidates failed. looked for: ${lookedFor.join(', ')}. seen requests: ${seen}. page=${sanitizeUrlForLog(this.page.url())}. frames=${frames.join(' | ') || 'none'}. ${describeError(err)}`;
-        debug(message);
-        throw new Error(message);
-      });
+      let url: string;
+      let request: HTTPRequest;
+      try {
+        ({ url, request } = await Promise.any(requestWaiters));
+      } catch (err) {
+        const sniffed = sniffer.matchedRequests[0];
+        if (!sniffed) {
+          const frames = this.page.frames().map(frame => sanitizeUrlForLog(frame.url()));
+          const seen = sniffer.seen.length ? sniffer.seen.join(', ') : 'none';
+          const message = `Mizrahi TX API: all candidates failed. looked for: ${lookedFor.join(', ')}. seen requests: ${seen}. page=${sanitizeUrlForLog(this.page.url())}. frames=${frames.join(' | ') || 'none'}. ${describeError(err)}`;
+          debug(message);
+          throw new Error(message);
+        }
+        url = sniffed.url().split('?')[0];
+        request = sniffed;
+        debug('waitForRequest missed; using sniffed %s', sanitizeUrlForLog(url));
+        this.logStep('MIZRAHI_WAIT_API', `waitForRequest missed — using sniffed ${sanitizeUrlForLog(url)}`);
+      }
+
+      const data = createDataFromRequest(request, this.options.startDate);
+      const headers = createHeadersFromRequest(request);
+      debug(
+        'replay POST %s from=%s to=%s xsrf=%s',
+        sanitizeUrlForLog(url),
+        data.inFromDate,
+        data.inToDate,
+        Boolean(headers.mizrahixsrftoken),
+      );
+      const response = await fetchPostWithinPage<ScrapedTransactionsResult>(this.page, url, data, headers);
+      const apiHeaders = headers;
+      debug(
+        'API response url=%s success=%s rows=%s yitra=%s',
+        sanitizeUrlForLog(url),
+        response?.header?.success,
+        response?.body?.table?.rows?.length ?? 'n/a',
+        response?.body?.fields?.Yitra ?? 'n/a',
+      );
 
       if (!response || response.header.success === false) {
         throw new Error(

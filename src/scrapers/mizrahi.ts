@@ -278,6 +278,16 @@ async function getExtraTransactionDetails(
   };
 }
 
+function israelYmd(value: Date | string): string {
+  const d = typeof value === 'string' ? new Date(value) : value;
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jerusalem',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+}
+
 function parseYitra(raw: unknown): number | undefined {
   if (raw == null || raw === '') {
     return undefined;
@@ -601,12 +611,13 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
           txn.status = TransactionStatuses.Pending;
         });
 
-      // workaround for a bug which the bank's API returns transactions before the requested start date
-      const startMoment = getStartMoment(this.options.startDate);
-      const oshTxnAfterStartDate = oshTxn.filter(txn => moment(txn.date).isSameOrAfter(startMoment));
+      // Compare Israel calendar days — UTC ISO timestamps sit on the previous
+      // UTC day and were dropped by isSameOrAfter(startMoment).
+      const startYmd = israelYmd(getStartMoment(this.options.startDate).toDate());
+      const oshTxnAfterStartDate = oshTxn.filter(txn => israelYmd(txn.date) >= startYmd);
       debug(
         'date filter start=%s kept=%d dropped=%d',
-        startMoment.format(DATE_FORMAT),
+        startYmd,
         oshTxnAfterStartDate.length,
         oshTxn.length - oshTxnAfterStartDate.length,
       );

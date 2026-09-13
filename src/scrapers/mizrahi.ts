@@ -278,6 +278,14 @@ async function getExtraTransactionDetails(
   };
 }
 
+function parseYitra(raw: unknown): number | undefined {
+  if (raw == null || raw === '') {
+    return undefined;
+  }
+  const n = typeof raw === 'number' ? raw : Number(String(raw).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function createDataFromRequest(request: HTTPRequest, optionsStartDate: Date) {
   const data = JSON.parse(request.postData() || '{}');
 
@@ -483,13 +491,24 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     try {
       // get428Index fires on the click; arm waiters first so we do not miss it
-      // while reading the account number.
+      // while reading the account number. The page's own reply usually has Yitra;
+      // the later date-range replay often does not.
       const requestWaiters = TRANSACTIONS_REQUEST_URLS.map(url => {
-        debug('waiting for request %s', sanitizeUrlForLog(url));
-        return this.page.waitForRequest(url).then(request => {
-          debug('caught request %s %s', request.method(), sanitizeUrlForLog(request.url()));
-          return { url, request };
-        });
+        debug('waiting for response %s', sanitizeUrlForLog(url));
+        return this.page
+          .waitForResponse(res => res.url().split('?')[0] === url && res.request().method() === 'POST')
+          .then(async res => {
+            const request = res.request();
+            debug('caught response %s %s', request.method(), sanitizeUrlForLog(request.url()));
+            let pageYitra: unknown;
+            try {
+              const json = (await res.json()) as ScrapedTransactionsResult;
+              pageYitra = json?.body?.fields?.Yitra;
+            } catch (err) {
+              debug('could not read page get428Index body %s', describeError(err));
+            }
+            return { url, request, pageYitra };
+          });
       });
       requestWaiters.forEach(waiter => {
         void waiter.catch(() => undefined);
@@ -510,8 +529,9 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
       let url: string;
       let request: HTTPRequest;
+      let pageYitra: unknown;
       try {
-        ({ url, request } = await Promise.any(requestWaiters));
+        ({ url, request, pageYitra } = await Promise.any(requestWaiters));
       } catch (err) {
         const sniffed = sniffer.matchedRequests[0];
         if (!sniffed) {
@@ -553,9 +573,18 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       }
 
       const relevantRows = response.body.table.rows.filter(row => row.RecTypeSpecified);
+      const replayYitra = parseYitra(response.body.fields?.Yitra);
+      const liveYitra = parseYitra(pageYitra);
+      const balance = replayYitra ?? liveYitra;
       this.logStep(
         'MIZRAHI_API',
-        `found ${response.body.table.rows.length} row(s), relevant=${relevantRows.length}, yitra=${response.body.fields?.Yitra ?? 'n/a'}`,
+        `found ${response.body.table.rows.length} row(s), relevant=${relevantRows.length}, yitra=${replayYitra ?? 'n/a'}, pageYitra=${liveYitra ?? 'n/a'}`,
+      );
+      debug(
+        'get428Index fields=%o replayYitra=%s pageYitra=%s',
+        response.body.fields ? Object.keys(response.body.fields) : [],
+        replayYitra ?? 'n/a',
+        liveYitra ?? 'n/a',
       );
       const oshTxn = await convertTransactions(
         relevantRows,
@@ -592,7 +621,7 @@ class MizrahiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
       return {
         accountNumber,
         txns: allTxn,
-        balance: +response.body.fields?.Yitra,
+        ...(balance !== undefined ? { balance } : {}),
       };
     } finally {
       sniffer.stop();
